@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 import argparse
 import time
-import xxhash
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -49,8 +49,7 @@ RECORD_CODER = coders.TupleCoder([
 def fen_to_bucket(fen: str, num_buckets: int) -> int:
     """Deterministic hash of FEN to bucket ID."""
     # Using first 8 bytes of MD5 for good distribution
-    # (faster than full hash, still uniform)
-    return xxhash.xxh64_intdigest(fen) % num_buckets
+    return int(hashlib.md5(fen.encode()).hexdigest()[:8], 16) % num_buckets
 
 
 # =============================================================================
@@ -65,6 +64,7 @@ def run_phase1(
         shard_range: tuple[int, int] | None = None,
         pattern: str = '*.bag',
         compress: bool = False,
+        delete_after: bool = False,
 ):
     """Run phase 1 on a range of shards."""
 
@@ -79,6 +79,7 @@ def run_phase1(
     print(f"  Buckets: {num_buckets}")
     print(f"  Worker ID: {worker_id}")
     print(f"  Compress: {compress}")
+    print(f"  Delete after: {delete_after}")
     print("=" * 60)
 
     total_records = 0
@@ -98,12 +99,12 @@ def run_phase1(
         for idx, input_file in enumerate(input_files):
             print(f"[{idx + 1}/{len(input_files)}] {input_file.name}")
 
-
-            stats = {'records': 0, 'time': 0.0 }
+            stats = {'records': 0, 'time': 0.0}
             start = time.time()
 
             output_dir.mkdir(parents=True, exist_ok=True)
 
+            file_success = False
             try:
                 """
                 Process a single shard into bucket partials using streaming writes.
@@ -126,20 +127,26 @@ def run_phase1(
                         print(f"    {i + 1:,}/{num_records:,} records...")
 
                 stats['records'] = num_records
+                file_success = True
+
             except Exception as e:
                 print(f"Failure processing {idx}, {e}")
 
             stats['time'] = time.time() - start
             stats['buckets_written'] = len(writers)
 
-
             total_records += stats['records']
             rate = stats['records'] / stats['time'] if stats['time'] > 0 else 0
             print(f"  {stats['records']:,} records in {stats['time']:.1f}s ({rate:,.0f}/s)")
             print(f"  Wrote to {stats['buckets_written']} buckets")
 
+            # Delete source file after successful processing
+            if delete_after and file_success:
+                input_file.unlink()
+                print(f"  Deleted: {input_file.name}")
+
             # ETA
-            elapsed = time.time() - start
+            elapsed = time.time() - initial_start
             avg_time = elapsed / (idx + 1)
             remaining = len(input_files) - idx - 1
             eta = avg_time * remaining
@@ -273,6 +280,7 @@ def run_single_machine(
         num_buckets: int,
         pattern: str = '*.bag',
         compress: bool = True,
+        delete_after: bool = False,
 ):
     """Run both phases on a single machine."""
 
@@ -287,6 +295,7 @@ def run_single_machine(
         worker_id='local',
         pattern=pattern,
         compress=False,  # Don't compress intermediates (speed)
+        delete_after=delete_after,
     )
 
     print("\n")
@@ -341,9 +350,10 @@ Examples:
     p_single.add_argument('--pattern', default='*.bag')
     p_single.add_argument('--compress', action='store_true',
                           help='Compress final output')
+    p_single.add_argument('--delete-after', action='store_true',
+                          help='Delete source files after processing')
 
     # Phase 1
-    # reorg_fast_2.py phase1 --input-dir="" --output-dir="" --buckets=1000 --worker-id=olcay --shards 0-500
     p_phase1 = subparsers.add_parser('phase1', help='Shard → bucket partials')
     p_phase1.add_argument('--input-dir', type=Path, required=True)
     p_phase1.add_argument('--output-dir', type=Path, required=True)
@@ -355,6 +365,8 @@ Examples:
     p_phase1.add_argument('--pattern', default='*.bag')
     p_phase1.add_argument('--compress', action='store_true',
                           help='Compress intermediate outputs')
+    p_phase1.add_argument('--delete-after', action='store_true',
+                          help='Delete source files after processing')
 
     # Phase 2
     p_phase2 = subparsers.add_parser('phase2', help='Merge bucket partials')
@@ -374,6 +386,7 @@ Examples:
             num_buckets=args.buckets,
             pattern=args.pattern,
             compress=args.compress,
+            delete_after=args.delete_after,
         )
 
     elif args.command == 'phase1':
@@ -386,6 +399,7 @@ Examples:
             shard_range=shard_range,
             pattern=args.pattern,
             compress=args.compress,
+            delete_after=args.delete_after,
         )
 
     elif args.command == 'phase2':
