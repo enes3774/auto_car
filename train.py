@@ -22,7 +22,9 @@ import math
 from data_preparation import (
     ChessTokenizer,
     ChessMAVDataset,
+    ChessMAVIterableDataset,
     chess_collate_fn,
+    create_streaming_dataloader,
     NUM_VALUE_BUCKETS
 )
 
@@ -267,7 +269,7 @@ class ChessMAVTrainer(Trainer):
         
         return (loss, outputs) if return_outputs else loss
     
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], start_time: float = None) -> None:
         """Override log to include component losses"""
         if self.loss_count > 0:
             logs['ce_loss'] = self.running_losses['ce_loss'] / self.loss_count
@@ -277,7 +279,11 @@ class ChessMAVTrainer(Trainer):
             self.running_losses = {'ce_loss': 0.0, 'hl_gauss_loss': 0.0, 'total_loss': 0.0}
             self.loss_count = 0
         
-        super().log(logs)
+        # Call parent with start_time if provided
+        if start_time is not None:
+            super().log(logs, start_time)
+        else:
+            super().log(logs)
 
 
 # ============================================================================
@@ -366,6 +372,17 @@ class ChessTrainingConfig:
     model_name: str = "Qwen/Qwen3-1.7B"
     use_flash_attention: bool = True
     
+    # Data loading
+    streaming: bool = True  # Use streaming for large datasets (recommended)
+    max_samples: int = None  # Limit samples for testing (None = all)
+    eval_data_path: str = None  # Path to eval data (optional)
+    eval_split: float = 0.0  # If > 0, split train data for eval (e.g., 0.05 = 5%)
+    
+    # For streaming mode: must specify max_steps since dataset has no __len__
+    max_steps: int = -1  # -1 means calculate from epochs (only works for non-streaming)
+    estimated_samples: int = None  # Estimate total samples for streaming mode
+    eval_max_samples: int = 5000  # Limit eval samples (None = all)
+    
     # Training hyperparameters
     num_epochs: int = 2
     per_device_train_batch_size: int = 2
@@ -394,12 +411,27 @@ class ChessTrainingConfig:
     deepspeed_config: Optional[str] = None
 
 
-def create_training_args(config: ChessTrainingConfig) -> TrainingArguments:
+def create_training_args(config: ChessTrainingConfig, is_streaming: bool = False) -> TrainingArguments:
     """Create HuggingFace TrainingArguments from config"""
+    
+    # For streaming, we need max_steps instead of num_epochs
+    if is_streaming:
+        if config.max_steps <= 0 and config.estimated_samples:
+            # Calculate max_steps from estimated samples
+            effective_batch = config.per_device_train_batch_size * config.gradient_accumulation_steps
+            steps_per_epoch = config.estimated_samples // effective_batch
+            config.max_steps = steps_per_epoch * config.num_epochs
+            print(f"Calculated max_steps: {config.max_steps} ({steps_per_epoch} steps/epoch × {config.num_epochs} epochs)")
+        elif config.max_steps <= 0:
+            raise ValueError(
+                "Streaming mode requires --max_steps or --estimated_samples.\n"
+                "Example: --max_steps 10000 or --estimated_samples 500000000"
+            )
     
     return TrainingArguments(
         output_dir=config.output_dir,
-        num_train_epochs=config.num_epochs,
+        num_train_epochs=config.num_epochs if not is_streaming else 1,
+        max_steps=config.max_steps if is_streaming else -1,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -424,8 +456,8 @@ def create_training_args(config: ChessTrainingConfig) -> TrainingArguments:
         save_steps=config.save_steps,
         save_total_limit=3,
         
-        # Evaluation
-        eval_strategy="steps" if config.eval_steps else "no",
+        # Evaluation - only enable if we have eval data
+        eval_strategy="no",  # Will be overridden if eval_dataset provided
         eval_steps=config.eval_steps,
         
         # DeepSpeed
@@ -459,11 +491,60 @@ def train_chess_mav(config: ChessTrainingConfig):
     
     # Create datasets
     print(f"\nLoading training data from: {config.data_path}")
-    train_dataset = ChessMAVDataset(
-        data_path=config.data_path,
-        tokenizer=chess_tokenizer,
-        max_length=config.max_length
-    )
+    
+    eval_dataset = None
+    
+    if config.streaming:
+        # Streaming mode - loads one file at a time (for large datasets)
+        print("Using STREAMING mode (memory efficient)")
+        train_dataset = ChessMAVIterableDataset(
+            data_path=config.data_path,
+            tokenizer=chess_tokenizer,
+            max_length=config.max_length,
+            shuffle_files=True,
+            shuffle_moves=True,
+        )
+        
+        # For streaming, eval must be a separate path (can't split)
+        if config.eval_data_path:
+            print(f"Loading eval data from: {config.eval_data_path}")
+            eval_dataset = ChessMAVDataset(
+                data_path=config.eval_data_path,
+                tokenizer=chess_tokenizer,
+                max_length=config.max_length,
+                max_samples=config.eval_max_samples,
+            )
+    else:
+        # Load all into memory (for smaller datasets)
+        print("Using IN-MEMORY mode")
+        train_dataset = ChessMAVDataset(
+            data_path=config.data_path,
+            tokenizer=chess_tokenizer,
+            max_length=config.max_length,
+            max_samples=config.max_samples,
+        )
+        
+        # Split for eval if requested
+        if config.eval_split > 0:
+            total = len(train_dataset)
+            eval_size = int(total * config.eval_split)
+            train_size = total - eval_size
+            
+            print(f"Splitting: {train_size} train, {eval_size} eval")
+            
+            from torch.utils.data import random_split
+            train_dataset, eval_dataset = random_split(
+                train_dataset, 
+                [train_size, eval_size]
+            )
+        elif config.eval_data_path:
+            print(f"Loading eval data from: {config.eval_data_path}")
+            eval_dataset = ChessMAVDataset(
+                data_path=config.eval_data_path,
+                tokenizer=chess_tokenizer,
+                max_length=config.max_length,
+                max_samples=config.eval_max_samples,
+            )
     
     # Create data collator
     def collate_fn(batch):
@@ -473,13 +554,21 @@ def train_chess_mav(config: ChessTrainingConfig):
         )
     
     # Create training arguments
-    training_args = create_training_args(config)
+    training_args = create_training_args(config, is_streaming=config.streaming)
+    
+    # Enable eval if we have eval dataset
+    if eval_dataset is not None:
+        training_args.eval_strategy = "steps"
+        if not config.eval_steps:
+            training_args.eval_steps = 500  # Default eval every 500 steps
+        print(f"Evaluation enabled: every {training_args.eval_steps} steps")
     
     # Create trainer
     trainer = ChessMAVTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collate_fn,
         value_token_start=chess_tokenizer.value_token_start,
         value_token_end=chess_tokenizer.value_token_end,
@@ -541,7 +630,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Train Chess MAV Model")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to JSONL data")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to JSONL data or folder")
     parser.add_argument("--uci_moves_file", type=str, required=True, help="Path to UCI moves JSON")
     parser.add_argument("--output_dir", type=str, default="./chess_mav_output")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
@@ -552,6 +641,13 @@ if __name__ == "__main__":
     parser.add_argument("--sigma", type=float, default=0.75, help="HL-Gauss sigma")
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit samples for testing")
+    parser.add_argument("--no-streaming", action="store_true", help="Load all data into memory")
+    parser.add_argument("--eval_data_path", type=str, default=None, help="Path to eval data folder/file")
+    parser.add_argument("--eval_split", type=float, default=0.0, help="Split ratio for eval (e.g., 0.05)")
+    parser.add_argument("--eval_steps", type=int, default=500, help="Eval every N steps")
+    parser.add_argument("--eval_max_samples", type=int, default=5000, help="Max samples for eval dataset")
+    parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (required for streaming)")
+    parser.add_argument("--estimated_samples", type=int, default=None, help="Estimated total samples (for streaming)")
     
     args = parser.parse_args()
     
@@ -566,6 +662,14 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         sigma=args.sigma,
+        streaming=not getattr(args, 'no_streaming', False),
+        max_samples=args.max_samples,
+        eval_data_path=args.eval_data_path,
+        eval_split=args.eval_split,
+        eval_steps=args.eval_steps,
+        eval_max_samples=args.eval_max_samples,
+        max_steps=args.max_steps,
+        estimated_samples=args.estimated_samples,
     )
     
     # Setup DeepSpeed if requested
