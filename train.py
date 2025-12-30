@@ -171,6 +171,7 @@ class ChessMAVTrainer(Trainer):
             sigma_to_bin_ratio=sigma_to_bin_ratio,
             value_loss_weight=value_loss_weight
         )
+        self.mav_loss = self.mav_loss.to(self.model.device)
 
         # Track running losses for logging
         self.running_losses = {'ce_loss': 0.0, 'hl_gauss_loss': 0.0, 'total_loss': 0.0}
