@@ -126,7 +126,7 @@ class ChessMAVLoss(nn.Module):
             value_logits_full = flat_logits[flat_value_mask]
             value_logits = value_logits_full[:, self.value_token_start:self.value_token_end]
 
-            # Convert labels to bucket indices (0-6)
+            # Convert labels to bucket indices (0-63)
             value_labels = flat_labels[flat_value_mask] - self.value_token_start
 
             # Compute HL-Gauss loss
@@ -170,8 +170,7 @@ class ChessMAVTrainer(Trainer):
             sigma_to_bin_ratio=sigma_to_bin_ratio,
             value_loss_weight=value_loss_weight
         )
-        self.mav_loss = self.mav_loss.to(self.model.device)
-
+        self.mav_loss.to(self.model.device)
         # Track running losses for logging
         self.running_losses = {'ce_loss': 0.0, 'hl_gauss_loss': 0.0, 'total_loss': 0.0}
         self.loss_count = 0
@@ -225,7 +224,7 @@ class ChessMAVTrainer(Trainer):
 # ============================================================================
 
 def setup_model_and_tokenizer(
-        model_name: str = "Qwen/Qwen-1.7B",
+        model_name: str = "Qwen/Qwen3-1.7B",
         uci_moves_file: str = None,
         use_flash_attention: bool = True
 ) -> Tuple[AutoModelForCausalLM, ChessTokenizer]:
@@ -302,7 +301,7 @@ class ChessTrainingConfig:
     output_dir: str = "./chess_mav_output"
 
     # Model
-    model_name: str = "Qwen/Qwen-1.7B"
+    model_name: str = "Qwen/Qwen3-1.7B"
     use_flash_attention: bool = True
 
     # Data loading
@@ -323,7 +322,7 @@ class ChessTrainingConfig:
     gradient_accumulation_steps: int = 8  # Effective batch size = 16
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.0
+    warmup_ratio: float = 0.02
     max_length: int = 2048
 
     # HL-Gauss parameters
