@@ -320,8 +320,6 @@ def format_chess_example(
     # Best action (from original data, not affected by shuffle)
     # Handle both formats: "g3d6" or ["g3d6", 0.9]
     
-    if isinstance(best_move, list):
-        best_move = best_move[0]  # Extract move from [move, value] format
     
     best_move_token = tokenizer.get_move_token(best_move)
     output_text += f"\n[%best_action {best_move_token}]"
@@ -385,7 +383,190 @@ def format_to_tokens(
 
 
 # ============================================================================
-# DATASET
+# STREAMING DATASET (for large datasets that don't fit in memory)
+# ============================================================================
+
+class ChessMAVIterableDataset(torch.utils.data.IterableDataset):
+    """
+    Streaming Dataset for Chess MAV training - loads one file at a time
+    
+    Use this when your dataset is too large to fit in memory.
+    Each file is loaded, processed, and released before loading the next.
+    """
+    
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: ChessTokenizer,
+        max_length: int = 2048,
+        include_next_fen: bool = True,
+        shuffle_moves: bool = True,
+        shuffle_files: bool = True,
+        file_extensions: List[str] = [".jsonl", ".json"],
+        samples_per_file: Optional[int] = None,  # Limit samples per file for testing
+    ):
+        """
+        Args:
+            data_path: Path to folder containing JSONL/JSON files
+            tokenizer: ChessTokenizer instance
+            max_length: Maximum sequence length
+            include_next_fen: Whether to include next FEN prediction
+            shuffle_moves: Randomize move order (recommended)
+            shuffle_files: Randomize order of files each epoch
+            file_extensions: Extensions to look for
+            samples_per_file: Limit samples per file (for testing)
+        """
+        self.data_path = Path(data_path)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.include_next_fen = include_next_fen
+        self.shuffle_moves = shuffle_moves
+        self.shuffle_files = shuffle_files
+        self.samples_per_file = samples_per_file
+        
+        # Collect all files
+        self.files = []
+        for ext in file_extensions:
+            self.files.extend(self.data_path.glob(f"*{ext}"))
+        self.files = sorted(set(self.files))
+        
+        if not self.files:
+            raise FileNotFoundError(f"No files found in {data_path}")
+        
+        print(f"Found {len(self.files)} files (streaming mode - one at a time)")
+        
+        # Estimate total samples (optional - for progress tracking)
+        self._estimated_samples = None
+    
+    def _load_file_items(self, filepath: Path):
+        """Generator that yields items from a single file"""
+        with open(filepath, 'r') as f:
+            first_char = f.read(1)
+            f.seek(0)
+            
+            if first_char == '[':
+                # JSON array
+                items = json.load(f)
+                for item in items:
+                    if all(k in item for k in ["fen", "moves", "best_action"]):
+                        yield item
+            else:
+                # JSONL
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        if all(k in item for k in ["fen", "moves", "best_action"]):
+                            yield item
+                    except json.JSONDecodeError:
+                        continue
+    
+    def _process_item(self, item: Dict) -> Dict[str, torch.Tensor]:
+        """Process a single item to training format"""
+        # Random top_n
+        top_n = random.choice(VALID_TOP_N)
+        
+        # Format to text
+        input_text, output_text, actual_top_n = format_chess_example(
+            item,
+            self.tokenizer,
+            top_n=top_n,
+            include_next_fen=self.include_next_fen,
+            shuffle_moves=self.shuffle_moves
+        )
+        
+        # Tokenize
+        return format_to_tokens(
+            input_text,
+            output_text,
+            self.tokenizer,
+            self.max_length,
+            top_n=top_n
+        )
+    
+    def __iter__(self):
+        """Iterate through all files, yielding processed samples"""
+        # Get worker info for distributed data loading
+        worker_info = torch.utils.data.get_worker_info()
+        
+        files = self.files.copy()
+        
+        # Shuffle files each epoch
+        if self.shuffle_files:
+            random.shuffle(files)
+        
+        # Split files among workers if using multiple workers
+        if worker_info is not None:
+            # Split files among workers
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            files = files[worker_id::num_workers]
+        
+        for filepath in files:
+            count = 0
+            for item in self._load_file_items(filepath):
+                if self.samples_per_file and count >= self.samples_per_file:
+                    break
+                
+                yield self._process_item(item)
+                count += 1
+
+
+def create_streaming_dataloader(
+    data_path: str,
+    tokenizer: ChessTokenizer,
+    batch_size: int = 4,
+    max_length: int = 2048,
+    num_workers: int = 2,
+    prefetch_factor: int = 2,
+    samples_per_file: Optional[int] = None,
+) -> DataLoader:
+    """
+    Create a streaming DataLoader for large datasets
+    
+    Args:
+        data_path: Path to folder with JSONL/JSON files
+        tokenizer: ChessTokenizer instance
+        batch_size: Samples per batch
+        max_length: Max sequence length
+        num_workers: DataLoader workers (each worker handles different files)
+        prefetch_factor: Batches to prefetch per worker
+        samples_per_file: Limit samples per file (for testing)
+    
+    Example:
+        # For 93 files × 500MB each
+        loader = create_streaming_dataloader(
+            "./training_data/",
+            tokenizer,
+            batch_size=4,
+            num_workers=2  # 2 workers load different files in parallel
+        )
+    """
+    dataset = ChessMAVIterableDataset(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        shuffle_moves=True,
+        shuffle_files=True,
+        samples_per_file=samples_per_file,
+    )
+    
+    collate_fn = lambda batch: chess_collate_fn(
+        batch,
+        pad_token_id=tokenizer.tokenizer.pad_token_id or 0
+    )
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+
+# ============================================================================
+# DATASET (loads all into memory - use for smaller datasets)
 # ============================================================================
 
 class ChessMAVDataset(Dataset):
@@ -393,6 +574,7 @@ class ChessMAVDataset(Dataset):
     PyTorch Dataset for Chess MAV training
     
     Features:
+    - LAZY LOADING: Only loads file index upfront, reads data on-demand
     - Supports single JSONL file OR folder with multiple JSONL/JSON files
     - Pre-assigns top_n to each sample for efficient batching
     - Randomizes move order (not sorted by value)
@@ -408,7 +590,8 @@ class ChessMAVDataset(Dataset):
         include_next_fen: bool = True,
         shuffle_moves: bool = True,
         preassign_top_n: bool = True,
-        file_extensions: List[str] = [".jsonl", ".json"]
+        file_extensions: List[str] = [".jsonl", ".json"],
+        lazy_loading: bool = True
     ):
         """
         Args:
@@ -420,137 +603,202 @@ class ChessMAVDataset(Dataset):
             shuffle_moves: Randomize move order (recommended, as per paper)
             preassign_top_n: Pre-assign top_n values for efficient batching
             file_extensions: Extensions to look for when data_path is a folder
+            lazy_loading: If True, only index files upfront, load data on-demand
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.include_next_fen = include_next_fen
         self.shuffle_moves = shuffle_moves
+        self.lazy_loading = lazy_loading
         
-        # Load data from file or folder
-        self.data = []
-        self.sample_top_n = []  # Pre-assigned top_n for each sample
+        self.data = []  # Only used if lazy_loading=False
+        self.sample_top_n = []
+        
+        # For lazy loading: store file info and sample indices
+        self.file_index = []  # List of (filepath, start_idx, count, is_json_array)
+        self.total_samples = 0
         
         data_path = Path(data_path)
         
         if data_path.is_file():
-            # Single file
             print(f"Loading data from single file: {data_path}")
-            self._load_file(data_path, max_samples)
+            self._index_file(data_path, max_samples)
         elif data_path.is_dir():
-            # Folder with multiple files
             print(f"Loading data from folder: {data_path}")
-            self._load_folder(data_path, file_extensions, max_samples)
+            self._index_folder(data_path, file_extensions, max_samples)
         else:
             raise FileNotFoundError(f"Data path not found: {data_path}")
         
-        # Pre-assign top_n values for each sample
+        # If not lazy loading, load all data now
+        if not lazy_loading:
+            print("Loading all data into memory...")
+            self._load_all_data()
+        
+        # Pre-assign top_n values
         if preassign_top_n:
             self._preassign_top_n()
         
-        print(f"Loaded {len(self.data)} samples total")
+        print(f"Total samples: {self.total_samples}")
+        print(f"Files indexed: {len(self.file_index)}")
+        if lazy_loading:
+            print(f"Lazy loading: ON (caches up to 10 files in memory)")
+        else:
+            print(f"Lazy loading: OFF (all data in memory)")
         print(f"Random top_n from: {VALID_TOP_N}")
         print(f"Move order: {'SHUFFLED (recommended)' if shuffle_moves else 'SORTED by value'}")
         
-        # Print top_n distribution
         if self.sample_top_n:
             from collections import Counter
             dist = Counter(self.sample_top_n)
             print(f"Top_n distribution: {dict(sorted(dist.items()))}")
     
-    def _load_file(self, filepath: Path, max_samples: Optional[int] = None):
-        """Load data from a single file (auto-detects JSON array vs JSONL)"""
-        count_before = len(self.data)
-        
+    def _index_file(self, filepath: Path, max_samples: Optional[int] = None):
+        """Index a single file (count samples without loading all data)"""
         with open(filepath, 'r') as f:
             first_char = f.read(1)
             f.seek(0)
             
-            if first_char == '[':
-                # JSON array format
-                self._load_json_array(f, filepath, max_samples)
+            is_json_array = (first_char == '[')
+            
+            if is_json_array:
+                # JSON array - need to parse to count
+                items = json.load(f)
+                count = sum(1 for item in items 
+                           if all(k in item for k in ["fen", "moves", "best_action"]))
+                if max_samples:
+                    count = min(count, max_samples - self.total_samples)
             else:
-                # JSONL format (one JSON per line)
-                self._load_jsonl(f, filepath, max_samples)
+                # JSONL - count lines
+                count = 0
+                for line in f:
+                    if max_samples and self.total_samples + count >= max_samples:
+                        break
+                    try:
+                        item = json.loads(line.strip())
+                        if all(k in item for k in ["fen", "moves", "best_action"]):
+                            count += 1
+                    except:
+                        pass
         
-        loaded = len(self.data) - count_before
-        print(f"  {filepath.name}: {loaded} samples")
+        if count > 0:
+            self.file_index.append({
+                'path': filepath,
+                'start_idx': self.total_samples,
+                'count': count,
+                'is_json_array': is_json_array
+            })
+            self.total_samples += count
+            print(f"  {filepath.name}: {count} samples")
     
-    def _load_jsonl(self, f, filepath: Path, max_samples: Optional[int] = None):
-        """Load from JSONL format"""
-        for line in f:
-            if max_samples and len(self.data) >= max_samples:
-                break
-            try:
-                item = json.loads(line.strip())
-                if all(k in item for k in ["fen", "moves", "best_action"]):
-                    self.data.append(item)
-            except json.JSONDecodeError:
-                continue
-    
-    def _load_json_array(self, f, filepath: Path, max_samples: Optional[int] = None):
-        """Load from JSON array format"""
-        try:
-            items = json.load(f)
-            for item in items:
-                if max_samples and len(self.data) >= max_samples:
-                    break
-                if all(k in item for k in ["fen", "moves", "best_action"]):
-                    self.data.append(item)
-        except json.JSONDecodeError as e:
-            print(f"  Warning: Failed to parse {filepath}: {e}")
-    
-    def _load_folder(
-        self, 
-        folder_path: Path, 
-        file_extensions: List[str],
-        max_samples: Optional[int] = None
-    ):
-        """Load data from all matching files in a folder (sorted order)"""
-        # Collect all matching files
+    def _index_folder(self, folder_path: Path, file_extensions: List[str], max_samples: Optional[int] = None):
+        """Index all files in folder"""
         files = []
         for ext in file_extensions:
             files.extend(folder_path.glob(f"*{ext}"))
-        
-        # Sort for consistent ordering
         files = sorted(set(files))
         
         if not files:
-            raise FileNotFoundError(
-                f"No files with extensions {file_extensions} found in {folder_path}"
-            )
+            raise FileNotFoundError(f"No files found in {folder_path}")
         
         print(f"Found {len(files)} files")
         
         for filepath in files:
-            if max_samples and len(self.data) >= max_samples:
-                print(f"  Reached max_samples ({max_samples}), stopping.")
+            if max_samples and self.total_samples >= max_samples:
+                print(f"  Reached max_samples ({max_samples}), stopping indexing.")
                 break
+            self._index_file(filepath, max_samples)
+    
+    def _load_all_data(self):
+        """Load all data into memory (when lazy_loading=False)"""
+        for file_info in self.file_index:
+            filepath = file_info['path']
+            is_json_array = file_info['is_json_array']
             
-            self._load_file(filepath, max_samples)
+            with open(filepath, 'r') as f:
+                if is_json_array:
+                    items = json.load(f)
+                    for item in items:
+                        if all(k in item for k in ["fen", "moves", "best_action"]):
+                            self.data.append(item)
+                else:
+                    for line in f:
+                        try:
+                            item = json.loads(line.strip())
+                            if all(k in item for k in ["fen", "moves", "best_action"]):
+                                self.data.append(item)
+                        except:
+                            pass
+    
+    def _get_item_lazy(self, idx: int) -> Dict:
+        """Get item using lazy loading with file caching"""
+        # Find which file contains this index
+        for file_info in self.file_index:
+            if idx < file_info['start_idx'] + file_info['count']:
+                local_idx = idx - file_info['start_idx']
+                filepath = file_info['path']
+                
+                # Check if file is cached
+                if not hasattr(self, '_file_cache'):
+                    self._file_cache = {}
+                    self._cache_order = []
+                    self._max_cache_size = 10  # Keep max 10 files in memory
+                
+                cache_key = str(filepath)
+                
+                if cache_key not in self._file_cache:
+                    # Load file into cache
+                    items = self._load_file_data(filepath, file_info['is_json_array'])
+                    
+                    # Manage cache size
+                    if len(self._cache_order) >= self._max_cache_size:
+                        # Remove oldest cached file
+                        oldest = self._cache_order.pop(0)
+                        del self._file_cache[oldest]
+                    
+                    self._file_cache[cache_key] = items
+                    self._cache_order.append(cache_key)
+                
+                return self._file_cache[cache_key][local_idx]
+        
+        raise IndexError(f"Index {idx} out of range")
+    
+    def _load_file_data(self, filepath: Path, is_json_array: bool) -> List[Dict]:
+        """Load all valid items from a file"""
+        items = []
+        with open(filepath, 'r') as f:
+            if is_json_array:
+                all_items = json.load(f)
+                for item in all_items:
+                    if all(k in item for k in ["fen", "moves", "best_action"]):
+                        items.append(item)
+            else:
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        if all(k in item for k in ["fen", "moves", "best_action"]):
+                            items.append(item)
+                    except:
+                        pass
+        return items
     
     def _preassign_top_n(self):
-        """
-        Pre-assign top_n values to enable efficient batching
-        
-        Strategy: Distribute VALID_TOP_N uniformly across samples
-        This ensures each batch can have samples with same top_n
-        """
-        n_samples = len(self.data)
-        
-        # Create repeating pattern of top_n values
+        """Pre-assign top_n values for efficient batching"""
+        n_samples = self.total_samples
         pattern = VALID_TOP_N * (n_samples // len(VALID_TOP_N) + 1)
         self.sample_top_n = pattern[:n_samples]
-        
-        # Shuffle to avoid ordering bias
         random.shuffle(self.sample_top_n)
     
     def __len__(self):
-        return len(self.data)
+        return self.total_samples
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        item = self.data[idx]
+        # Get raw item
+        if self.lazy_loading:
+            item = self._get_item_lazy(idx)
+        else:
+            item = self.data[idx]
         
-        # Get pre-assigned top_n or random
+        # Get pre-assigned top_n
         top_n = self.sample_top_n[idx] if self.sample_top_n else random.choice(VALID_TOP_N)
         
         # Format to text with randomized move order
@@ -572,11 +820,7 @@ class ChessMAVDataset(Dataset):
         )
     
     def get_top_n_indices(self) -> Dict[int, List[int]]:
-        """
-        Get indices grouped by top_n for batch sampling
-        
-        Returns: {top_n: [idx1, idx2, ...], ...}
-        """
+        """Get indices grouped by top_n for batch sampling"""
         from collections import defaultdict
         indices_by_top_n = defaultdict(list)
         
@@ -713,7 +957,7 @@ def create_dataloader(
     data_path: str,
     tokenizer: ChessTokenizer,
     batch_size: int = 4,
-    max_length: int = 2048,
+    max_length: int = 256,
     shuffle: bool = True,
     num_workers: int = 4,
     max_samples: Optional[int] = None,
@@ -864,8 +1108,12 @@ def inspect_sample(
     Returns:
         Dict with all sample information
     """
-    # Get raw data
-    raw_item = dataset.data[idx]
+    # Get raw data (works with both lazy and non-lazy loading)
+    if dataset.lazy_loading:
+        raw_item = dataset._get_item_lazy(idx)
+    else:
+        raw_item = dataset.data[idx]
+    
     top_n = dataset.sample_top_n[idx] if dataset.sample_top_n else 5
     
     # Format to text (for inspection)
