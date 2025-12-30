@@ -1,4 +1,4 @@
-@@ -0,0 +1,619 @@
+
 """
 Chess MAV Model - Training Script
 Full fine-tuning Qwen3 1.7B with HL-Gauss loss for value prediction
