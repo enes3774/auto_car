@@ -1,5 +1,5 @@
 """
-Chess MAV Model - Training Script (Optimized)
+Chess MAV Model - Training Script
 Full fine-tuning Qwen3 1.7B with HL-Gauss loss for value prediction
 """
 
@@ -47,19 +47,22 @@ class ChessMAVLoss(nn.Module):
             sigma_to_bin_ratio: float = 2.0,
             value_loss_weight: float = 1.0,
     ):
+        """
+        Args:
+            value_token_start: Start ID of value tokens in vocabulary
+            value_token_end: End ID of value tokens (exclusive)
+            num_buckets: Number of value buckets
+            sigma: Gaussian sigma for HL-Gauss
+            value_loss_weight: Weight for value loss relative to CE loss
+        """
         super().__init__()
         self.value_token_start = value_token_start
         self.value_token_end = value_token_end
         self.num_buckets = num_buckets
         self.value_loss_weight = value_loss_weight
-        self._device_set = False
 
-        self.hl_gauss = HLGaussLoss(
-            min_value=0.0, 
-            max_value=1.0, 
-            num_bins=num_buckets,
-            sigma_to_bin_ratio=sigma_to_bin_ratio
-        )
+        self.hl_gauss = HLGaussLoss(min_value=0.0, max_value=1.0, num_bins=num_buckets,
+                                    sigma_to_bin_ratio=sigma_to_bin_ratio)
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
     def forward(
@@ -70,12 +73,13 @@ class ChessMAVLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute combined loss
+        Args:
+            logits: Model output logits (batch, seq_len, vocab_size)
+            labels: Target labels (batch, seq_len)
+            value_token_mask: Boolean mask for value tokens (batch, seq_len)
+        Returns:
+            (total_loss, loss_dict) where loss_dict contains individual losses
         """
-        # Move HL-Gauss to correct device on first call
-        if not self._device_set:
-            self.hl_gauss = self.hl_gauss.to(logits.device)
-            self._device_set = True
-        
         batch_size, seq_len, vocab_size = logits.shape
 
         # Shift for next-token prediction
@@ -106,7 +110,7 @@ class ChessMAVLoss(nn.Module):
 
         loss_dict = {}
 
-        # 1. Standard CE loss for non-value tokens
+        # 1. Standard CE loss for non-value tokens (FEN, moves, format tokens)
         if flat_non_value_mask.sum() > 0:
             ce_logits = flat_logits[flat_non_value_mask]
             ce_labels = flat_labels[flat_non_value_mask]
@@ -118,14 +122,15 @@ class ChessMAVLoss(nn.Module):
 
         # 2. HL-Gauss loss for value tokens
         if flat_value_mask.sum() > 0:
+            # Extract only the value token logits (64 buckets)
             value_logits_full = flat_logits[flat_value_mask]
             value_logits = value_logits_full[:, self.value_token_start:self.value_token_end]
+
+            # Convert labels to bucket indices (0-6)
             value_labels = flat_labels[flat_value_mask] - self.value_token_start
-            
-            # Normalize labels to [0, 1] range for hl_gauss_pytorch
-            value_labels_normalized = value_labels.float() / (self.num_buckets - 1)
-            
-            hl_loss = self.hl_gauss(value_logits, value_labels_normalized)
+
+            # Compute HL-Gauss loss
+            hl_loss = self.hl_gauss(value_logits, value_labels)
             loss_dict['hl_gauss_loss'] = hl_loss.item()
         else:
             hl_loss = torch.tensor(0.0, device=logits.device)
@@ -152,7 +157,7 @@ class ChessMAVTrainer(Trainer):
             *args,
             value_token_start: int,
             value_token_end: int,
-            sigma_to_bin_ratio: float = 2.0,
+            sigma_to_bin_ratio: float,
             value_loss_weight: float = 1.0,
             **kwargs
     ):
@@ -165,6 +170,7 @@ class ChessMAVTrainer(Trainer):
             sigma_to_bin_ratio=sigma_to_bin_ratio,
             value_loss_weight=value_loss_weight
         )
+        self.mav_loss = self.mav_loss.to(self.model.device)
 
         # Track running losses for logging
         self.running_losses = {'ce_loss': 0.0, 'hl_gauss_loss': 0.0, 'total_loss': 0.0}
@@ -177,14 +183,20 @@ class ChessMAVTrainer(Trainer):
             return_outputs: bool = False,
             num_items_in_batch: Optional[int] = None
     ):
+        """
+        Override compute_loss to use custom HL-Gauss loss
+        """
         labels = inputs.pop("labels")
         value_token_mask = inputs.pop("value_token_mask", None)
 
+        # Forward pass
         outputs = model(**inputs)
         logits = outputs.logits
 
+        # Compute custom loss
         loss, loss_dict = self.mav_loss(logits, labels, value_token_mask)
 
+        # Update running losses for logging
         for key, value in loss_dict.items():
             self.running_losses[key] += value
         self.loss_count += 1
@@ -192,12 +204,16 @@ class ChessMAVTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_time: float = None) -> None:
+        """Override log to include component losses"""
         if self.loss_count > 0:
             logs['ce_loss'] = self.running_losses['ce_loss'] / self.loss_count
             logs['hl_gauss_loss'] = self.running_losses['hl_gauss_loss'] / self.loss_count
+
+            # Reset running losses
             self.running_losses = {'ce_loss': 0.0, 'hl_gauss_loss': 0.0, 'total_loss': 0.0}
             self.loss_count = 0
 
+        # Call parent with start_time if provided
         if start_time is not None:
             super().log(logs, start_time)
         else:
@@ -209,22 +225,26 @@ class ChessMAVTrainer(Trainer):
 # ============================================================================
 
 def setup_model_and_tokenizer(
-        model_name: str = "Qwen/Qwen3-1.7B",
+        model_name: str = "Qwen/Qwen-1.7B",
         uci_moves_file: str = None,
-        use_flash_attention: bool = True,
-        use_gradient_checkpointing: bool = False,
-        compile_model: bool = False,
+        use_flash_attention: bool = True
 ) -> Tuple[AutoModelForCausalLM, ChessTokenizer]:
     """
     Load model and tokenizer, add chess tokens, resize embeddings
+    Args:
+        model_name: HuggingFace model name
+        uci_moves_file: Path to JSON file with UCI moves
+        use_flash_attention: Whether to use Flash Attention 2
     """
     print(f"Loading model: {model_name}")
 
+    # Initialize chess tokenizer (adds special tokens)
     chess_tokenizer = ChessTokenizer(
         model_name,
         uci_moves_file=uci_moves_file
     )
 
+    # Load model with optimizations
     model_kwargs = {
         "trust_remote_code": True,
         "torch_dtype": torch.bfloat16,
@@ -235,38 +255,33 @@ def setup_model_and_tokenizer(
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
-    # Resize token embeddings
+    # Resize token embeddings for new tokens
     original_vocab_size = model.config.vocab_size
     new_vocab_size = len(chess_tokenizer)
 
     print(f"Resizing embeddings: {original_vocab_size} -> {new_vocab_size}")
     model.resize_token_embeddings(new_vocab_size)
 
-    # Initialize new embeddings
+    # Initialize new embeddings with mean of existing embeddings
     with torch.no_grad():
         embeddings = model.get_input_embeddings().weight
+
+        # Compute mean and std of original embeddings
         orig_mean = embeddings[:original_vocab_size].mean(dim=0)
         orig_std = embeddings[:original_vocab_size].std(dim=0)
+
+        # Initialize new tokens with similar distribution
         num_new_tokens = new_vocab_size - original_vocab_size
         new_embeds = torch.randn(num_new_tokens, embeddings.size(1)) * orig_std + orig_mean
         embeddings[original_vocab_size:] = new_embeds.to(embeddings.dtype).to(embeddings.device)
 
+        # Also update lm_head if tied weights
         if hasattr(model, 'lm_head') and model.lm_head.weight is not embeddings:
             lm_head = model.lm_head.weight
             lm_head[original_vocab_size:] = new_embeds.to(lm_head.dtype).to(lm_head.device)
 
-    # Gradient checkpointing (disabled by default for speed)
-    if use_gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        print("Gradient checkpointing: ENABLED (slower but less VRAM)")
-    else:
-        print("Gradient checkpointing: DISABLED (faster)")
-
-    # Compile model for speedup (PyTorch 2.0+)
-    if compile_model:
-        print("Compiling model with torch.compile()...")
-        model = torch.compile(model)
-        print("Model compiled!")
+    # Enable gradient checkpointing for memory efficiency
+    model.gradient_checkpointing_enable()
 
     print(f"Model ready with {model.num_parameters():,} parameters")
 
@@ -283,35 +298,33 @@ class ChessTrainingConfig:
 
     # Paths
     data_path: str = "chess_data.jsonl"
-    uci_moves_file: str = "uci_moves.json"
+    uci_moves_file: str = "uci_moves.json"  # JSON array of UCI move strings
     output_dir: str = "./chess_mav_output"
-    resume_from_checkpoint: str = None  # Path to checkpoint to resume from
 
     # Model
-    model_name: str = "Qwen/Qwen3-1.7B"
+    model_name: str = "Qwen/Qwen-1.7B"
     use_flash_attention: bool = True
-    compile_model: bool = False  # torch.compile for speedup
 
     # Data loading
-    streaming: bool = True
-    max_samples: int = None
-    eval_data_path: str = None
-    eval_split: float = 0.0
+    streaming: bool = True  # Use streaming for large datasets (recommended)
+    max_samples: int = None  # Limit samples for testing (None = all)
+    eval_data_path: str = None  # Path to eval data (optional)
+    eval_split: float = 0.0  # If > 0, split train data for eval (e.g., 0.05 = 5%)
 
-    # For streaming mode
-    max_steps: int = -1
-    estimated_samples: int = None
-    eval_max_samples: int = 5000
+    # For streaming mode: must specify max_steps since dataset has no __len__
+    max_steps: int = -1  # -1 means calculate from epochs (only works for non-streaming)
+    estimated_samples: int = None  # Estimate total samples for streaming mode
+    eval_max_samples: int = 5000  # Limit eval samples (None = all)
 
     # Training hyperparameters
-    num_epochs: int = 1  # Default to 1 epoch for speed
-    per_device_train_batch_size: int = 100
-    per_device_eval_batch_size: int = 100
-    gradient_accumulation_steps: int = 1
-    learning_rate: float = 3e-5
+    num_epochs: int = 2
+    per_device_train_batch_size: int = 2
+    per_device_eval_batch_size: int = 2
+    gradient_accumulation_steps: int = 8  # Effective batch size = 16
+    learning_rate: float = 2e-5
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.01  # Reduced from 0.03
-    max_length: int = 512  # Reduced for speed
+    warmup_ratio: float = 0.0
+    max_length: int = 2048
 
     # HL-Gauss parameters
     sigma_to_bin_ratio: float = 2.0
@@ -320,12 +333,12 @@ class ChessTrainingConfig:
     # Optimization
     fp16: bool = False
     bf16: bool = True
-    gradient_checkpointing: bool = False  # Disabled for speed
+    gradient_checkpointing: bool = True
 
     # Logging
     logging_steps: int = 10
-    save_steps: int = 5000  # Save more frequently for resume
-    eval_steps: int = 5000
+    save_steps: int = 500
+    eval_steps: int = 500
 
     # DeepSpeed
     deepspeed_config: Optional[str] = None
@@ -334,12 +347,15 @@ class ChessTrainingConfig:
 def create_training_args(config: ChessTrainingConfig, is_streaming: bool = False) -> TrainingArguments:
     """Create HuggingFace TrainingArguments from config"""
 
+    # For streaming, we need max_steps instead of num_epochs
     if is_streaming:
         if config.max_steps <= 0 and config.estimated_samples:
+            # Calculate max_steps from estimated samples
             effective_batch = config.per_device_train_batch_size * config.gradient_accumulation_steps
             steps_per_epoch = config.estimated_samples // effective_batch
             config.max_steps = steps_per_epoch * config.num_epochs
-            print(f"Calculated max_steps: {config.max_steps} ({steps_per_epoch} steps/epoch × {config.num_epochs} epochs)")
+            print(
+                f"Calculated max_steps: {config.max_steps} ({steps_per_epoch} steps/epoch × {config.num_epochs} epochs)")
         elif config.max_steps <= 0:
             raise ValueError(
                 "Streaming mode requires --max_steps or --estimated_samples.\n"
@@ -362,7 +378,7 @@ def create_training_args(config: ChessTrainingConfig, is_streaming: bool = False
         fp16=config.fp16,
         bf16=config.bf16,
 
-        # Checkpointing - DISABLED for speed (use save_steps instead)
+        # Checkpointing
         gradient_checkpointing=config.gradient_checkpointing,
 
         # Logging
@@ -370,13 +386,12 @@ def create_training_args(config: ChessTrainingConfig, is_streaming: bool = False
         logging_first_step=True,
         report_to=["tensorboard"],
 
-        # Saving - for resume capability
+        # Saving
         save_steps=config.save_steps,
-        save_total_limit=1,  # Keep only last checkpoint
-        save_safetensors=True,
+        save_total_limit=1,
 
-        # Evaluation
-        eval_strategy="no",
+        # Evaluation - only enable if we have eval data
+        eval_strategy="no",  # Will be overridden if eval_dataset provided
         eval_steps=config.eval_steps,
 
         # DeepSpeed
@@ -384,11 +399,8 @@ def create_training_args(config: ChessTrainingConfig, is_streaming: bool = False
 
         # Other
         dataloader_num_workers=4,
-        remove_unused_columns=False,
+        remove_unused_columns=False,  # Important! We need value_token_mask
         dataloader_pin_memory=True,
-        
-        # For resuming
-        ignore_data_skip=False,  # Set True if you want to restart data from beginning
     )
 
 
@@ -401,16 +413,14 @@ def train_chess_mav(config: ChessTrainingConfig):
     Main training function
     """
     print("=" * 60)
-    print("Chess MAV Model Training (Optimized)")
+    print("Chess MAV Model Training")
     print("=" * 60)
 
     # Setup model and tokenizer
     model, chess_tokenizer = setup_model_and_tokenizer(
         config.model_name,
         uci_moves_file=config.uci_moves_file,
-        use_flash_attention=config.use_flash_attention,
-        use_gradient_checkpointing=config.gradient_checkpointing,
-        compile_model=config.compile_model,
+        use_flash_attention=config.use_flash_attention
     )
 
     # Create datasets
@@ -419,6 +429,7 @@ def train_chess_mav(config: ChessTrainingConfig):
     eval_dataset = None
 
     if config.streaming:
+        # Streaming mode - loads one file at a time (for large datasets)
         print("Using STREAMING mode (memory efficient)")
         train_dataset = ChessMAVIterableDataset(
             data_path=config.data_path,
@@ -428,6 +439,7 @@ def train_chess_mav(config: ChessTrainingConfig):
             shuffle_moves=True,
         )
 
+        # For streaming, eval must be a separate path (can't split)
         if config.eval_data_path:
             print(f"Loading eval data from: {config.eval_data_path}")
             eval_dataset = ChessMAVDataset(
@@ -437,6 +449,7 @@ def train_chess_mav(config: ChessTrainingConfig):
                 max_samples=config.eval_max_samples,
             )
     else:
+        # Load all into memory (for smaller datasets)
         print("Using IN-MEMORY mode")
         train_dataset = ChessMAVDataset(
             data_path=config.data_path,
@@ -445,14 +458,19 @@ def train_chess_mav(config: ChessTrainingConfig):
             max_samples=config.max_samples,
         )
 
+        # Split for eval if requested
         if config.eval_split > 0:
             total = len(train_dataset)
             eval_size = int(total * config.eval_split)
             train_size = total - eval_size
+
             print(f"Splitting: {train_size} train, {eval_size} eval")
 
             from torch.utils.data import random_split
-            train_dataset, eval_dataset = random_split(train_dataset, [train_size, eval_size])
+            train_dataset, eval_dataset = random_split(
+                train_dataset,
+                [train_size, eval_size]
+            )
         elif config.eval_data_path:
             print(f"Loading eval data from: {config.eval_data_path}")
             eval_dataset = ChessMAVDataset(
@@ -476,7 +494,7 @@ def train_chess_mav(config: ChessTrainingConfig):
     if eval_dataset is not None:
         training_args.eval_strategy = "steps"
         if not config.eval_steps:
-            training_args.eval_steps = 5000
+            training_args.eval_steps = 500  # Default eval every 500 steps
         print(f"Evaluation enabled: every {training_args.eval_steps} steps")
 
     # Create trainer
@@ -492,25 +510,9 @@ def train_chess_mav(config: ChessTrainingConfig):
         value_loss_weight=config.value_loss_weight,
     )
 
-    # Train (with resume support)
+    # Train
     print("\nStarting training...")
-    if config.resume_from_checkpoint:
-        print(f"Resuming from checkpoint: {config.resume_from_checkpoint}")
-        trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
-    else:
-        # Auto-detect checkpoint in output_dir
-        last_checkpoint = None
-        if os.path.isdir(config.output_dir):
-            checkpoints = [d for d in os.listdir(config.output_dir) if d.startswith("checkpoint-")]
-            if checkpoints:
-                last_checkpoint = os.path.join(
-                    config.output_dir, 
-                    max(checkpoints, key=lambda x: int(x.split("-")[1]))
-                )
-                print(f"Found checkpoint: {last_checkpoint}")
-                print("Use --resume to continue from this checkpoint")
-        
-        trainer.train()
+    trainer.train()
 
     # Save final model
     print("\nSaving final model...")
@@ -561,66 +563,26 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train Chess MAV Model")
-    
-    # Required
-    parser.add_argument("--data_path", type=str, required=True, help="Path to data folder")
-    parser.add_argument("--uci_moves_file", type=str, required=True, help="Path to UCI moves file")
-    
-    # Paths
+    parser.add_argument("--data_path", type=str, required=True, help="Path to JSONL data or folder")
+    parser.add_argument("--uci_moves_file", type=str, required=True, help="Path to UCI moves JSON")
     parser.add_argument("--output_dir", type=str, default="./chess_mav_output")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
-    
-    # Resume training
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
-    parser.add_argument("--resume_from", type=str, default=None, help="Resume from specific checkpoint path")
-    
-    # Training params
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=100)
-    parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--warmup_ratio", type=float, default=0.01)
-    parser.add_argument("--max_length", type=int, default=512)
-    
-    # Steps
-    parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--estimated_samples", type=int, default=None)
-    parser.add_argument("--save_steps", type=int, default=5000)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    
-    # Loss
-    parser.add_argument("--sigma_to_bin_ratio", type=float, default=2.0)
-    parser.add_argument("--value_loss_weight", type=float, default=1.0)
-    
-    # Optimization flags
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable grad checkpointing (slower)")
-    parser.add_argument("--compile", action="store_true", help="Use torch.compile (10-20%% faster)")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--sigma_to_bin_ratio", type=float, default=2.0, help="HL-Gauss sigma")
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed")
+    parser.add_argument("--max_samples", type=int, default=None, help="Limit samples for testing")
     parser.add_argument("--no-streaming", action="store_true", help="Load all data into memory")
-    
-    # Eval
-    parser.add_argument("--eval_data_path", type=str, default=None)
-    parser.add_argument("--eval_split", type=float, default=0.0)
-    parser.add_argument("--eval_steps", type=int, default=5000)
-    parser.add_argument("--eval_max_samples", type=int, default=5000)
-    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--eval_data_path", type=str, default=None, help="Path to eval data folder/file")
+    parser.add_argument("--eval_split", type=float, default=0.0, help="Split ratio for eval (e.g., 0.05)")
+    parser.add_argument("--eval_steps", type=int, default=500, help="Eval every N steps")
+    parser.add_argument("--eval_max_samples", type=int, default=5000, help="Max samples for eval dataset")
+    parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (required for streaming)")
+    parser.add_argument("--estimated_samples", type=int, default=None, help="Estimated total samples (for streaming)")
 
     args = parser.parse_args()
-
-    # Handle resume
-    resume_checkpoint = None
-    if args.resume_from:
-        resume_checkpoint = args.resume_from
-    elif args.resume:
-        # Find latest checkpoint
-        if os.path.isdir(args.output_dir):
-            checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
-            if checkpoints:
-                resume_checkpoint = os.path.join(
-                    args.output_dir,
-                    max(checkpoints, key=lambda x: int(x.split("-")[1]))
-                )
-                print(f"Auto-detected checkpoint: {resume_checkpoint}")
 
     # Create config
     config = ChessTrainingConfig(
@@ -628,17 +590,11 @@ if __name__ == "__main__":
         uci_moves_file=args.uci_moves_file,
         output_dir=args.output_dir,
         model_name=args.model_name,
-        resume_from_checkpoint=resume_checkpoint,
         num_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        warmup_ratio=args.warmup_ratio,
-        max_length=args.max_length,
         sigma_to_bin_ratio=args.sigma_to_bin_ratio,
-        value_loss_weight=args.value_loss_weight,
-        gradient_checkpointing=args.gradient_checkpointing,
-        compile_model=args.compile,
         streaming=not getattr(args, 'no_streaming', False),
         max_samples=args.max_samples,
         eval_data_path=args.eval_data_path,
@@ -647,11 +603,9 @@ if __name__ == "__main__":
         eval_max_samples=args.eval_max_samples,
         max_steps=args.max_steps,
         estimated_samples=args.estimated_samples,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
     )
 
-    # Setup DeepSpeed
+    # Setup DeepSpeed if requested
     if args.deepspeed:
         ds_config_path = os.path.join(args.output_dir, "ds_config.json")
         os.makedirs(args.output_dir, exist_ok=True)
