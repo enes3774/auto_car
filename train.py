@@ -33,12 +33,6 @@ from data_preparation import (
 # ============================================================================
 
 class ChessMAVLoss(nn.Module):
-    """
-    Combined loss for Chess MAV model:
-    - Standard Cross-Entropy for FEN tokens and move tokens
-    - HL-Gauss for value bucket tokens
-    """
-
     def __init__(
             self,
             value_token_start: int,
@@ -47,23 +41,21 @@ class ChessMAVLoss(nn.Module):
             sigma_to_bin_ratio: float = 2.0,
             value_loss_weight: float = 1.0,
     ):
-        """
-        Args:
-            value_token_start: Start ID of value tokens in vocabulary
-            value_token_end: End ID of value tokens (exclusive)
-            num_buckets: Number of value buckets
-            sigma: Gaussian sigma for HL-Gauss
-            value_loss_weight: Weight for value loss relative to CE loss
-        """
         super().__init__()
         self.value_token_start = value_token_start
         self.value_token_end = value_token_end
         self.num_buckets = num_buckets
         self.value_loss_weight = value_loss_weight
 
-        self.hl_gauss = HLGaussLoss(min_value=0.0, max_value=1.0, num_bins=num_buckets,
-                                    sigma_to_bin_ratio=sigma_to_bin_ratio)
+        # FIX: Use bucket range 0-63, not 0-1
+        self.hl_gauss = HLGaussLoss(
+            min_value=0, 
+            max_value=num_buckets - 1,  # 63
+            num_bins=num_buckets,
+            sigma_to_bin_ratio=sigma_to_bin_ratio
+        )
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+        self._device_set = False
 
     def forward(
             self,
@@ -71,22 +63,17 @@ class ChessMAVLoss(nn.Module):
             labels: torch.Tensor,
             value_token_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute combined loss
-        Args:
-            logits: Model output logits (batch, seq_len, vocab_size)
-            labels: Target labels (batch, seq_len)
-            value_token_mask: Boolean mask for value tokens (batch, seq_len)
-        Returns:
-            (total_loss, loss_dict) where loss_dict contains individual losses
-        """
+        
+        # Move to correct device on first call
+        if not self._device_set:
+            self.hl_gauss = self.hl_gauss.to(logits.device)
+            self._device_set = True
+        
         batch_size, seq_len, vocab_size = logits.shape
 
-        # Shift for next-token prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        # Create value token mask from labels if not provided
         if value_token_mask is None:
             value_token_mask = (
                     (shift_labels >= self.value_token_start) &
@@ -95,14 +82,10 @@ class ChessMAVLoss(nn.Module):
         else:
             value_token_mask = value_token_mask[..., 1:].contiguous()
 
-        # Valid positions (not padding, not ignored)
         valid_mask = shift_labels != -100
-
-        # Separate masks
         value_positions = value_token_mask & valid_mask
         non_value_positions = ~value_token_mask & valid_mask
 
-        # Flatten for loss computation
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
         flat_value_mask = value_positions.view(-1)
@@ -110,7 +93,7 @@ class ChessMAVLoss(nn.Module):
 
         loss_dict = {}
 
-        # 1. Standard CE loss for non-value tokens (FEN, moves, format tokens)
+        # CE loss for non-value tokens
         if flat_non_value_mask.sum() > 0:
             ce_logits = flat_logits[flat_non_value_mask]
             ce_labels = flat_labels[flat_non_value_mask]
@@ -120,28 +103,24 @@ class ChessMAVLoss(nn.Module):
             ce_loss = torch.tensor(0.0, device=logits.device)
             loss_dict['ce_loss'] = 0.0
 
-        # 2. HL-Gauss loss for value tokens
+        # HL-Gauss loss for value tokens
         if flat_value_mask.sum() > 0:
-            # Extract only the value token logits (64 buckets)
             value_logits_full = flat_logits[flat_value_mask]
             value_logits = value_logits_full[:, self.value_token_start:self.value_token_end]
+            
+            # FIX: Convert to float, keep as bucket indices (0-63)
+            value_labels = (flat_labels[flat_value_mask] - self.value_token_start).float()
 
-            # Convert labels to bucket indices (0-63)
-            value_labels = flat_labels[flat_value_mask] - self.value_token_start
-
-            # Compute HL-Gauss loss
             hl_loss = self.hl_gauss(value_logits, value_labels)
             loss_dict['hl_gauss_loss'] = hl_loss.item()
         else:
             hl_loss = torch.tensor(0.0, device=logits.device)
             loss_dict['hl_gauss_loss'] = 0.0
 
-        # Combined loss
         total_loss = ce_loss + self.value_loss_weight * hl_loss
         loss_dict['total_loss'] = total_loss.item()
 
         return total_loss, loss_dict
-
 
 # ============================================================================
 # CUSTOM TRAINER
